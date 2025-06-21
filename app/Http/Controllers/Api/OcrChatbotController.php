@@ -5,13 +5,11 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Services\OpenAi\OpenaiService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Storage;
 
 class OcrChatbotController extends Controller
 {
-    
     public function index(Request $request)
     {
         $openai = new OpenaiService();
@@ -22,82 +20,105 @@ class OcrChatbotController extends Controller
             'photo' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:10240', // max 10MB
         ]);
 
-        // Obtener o crear thread
-        if (!$threadId = $request->input('thread_id')) {
-            $thread = $client->threads()->create([]);
-            $threadId = $thread->id;
-        } else {
-            $threadId = $request->input('thread_id');
-        }
-
         // Save the uploaded file
         $photo = $request->file('photo');
         $fileInfo = $this->saveUploadedFile($photo);
-
+        
         try {
-
             // Crear un run para procesar el mensaje
-            $run = $client->threads()->runs()->create($threadId, [
-                'assistant_id' => 'asst_kMOfRpaCxApxktOJWKcyi1VB',
+            $run = $client->threads()->createAndRun(
                 [
-                    'type' => 'image_url',
-                    'image_url' => [
-                        'url' => $fileInfo['full_path']
-                    ]
+                    'assistant_id' => 'asst_kMOfRpaCxApxktOJWKcyi1VB',
+                    'thread' => [
+                        'messages' =>
+                            [
+                                [
+                                    'role' => 'user',
+                                    'content' => [
+                                        [
+                                            'type' => 'text',
+                                            'text' => 'Por favor, extrae todo el texto de esta imagen usando OCR.'
+                                        ],
+                                        [
+                                            'type' => 'image_url',
+                                            'image_url' => [
+                                                'url' => $fileInfo['full_path']
+                                            ]
+                                        ]
+                                    ]
+                                ]
+                            ],
+                    ],
                 ],
-                [
-                    'type' => 'text',
-                    'text' => 'Por favor, extrae todo el texto de esta imagen usando OCR.'
-                ]
-            ]);
+            );
 
             // Esperar a que el run se complete
+            $runId = $run->id;
+            $threadId = $run->threadId;
+            
             do {
-                sleep(1);
-                $run = $client->threads()->runs()->retrieve($threadId, $run->id);
-            } while (in_array($run->status, ['queued', 'in_progress']));
+                $runStatus = $client->threads()->runs()->retrieve($threadId, $runId);
+                sleep(1); // Esperar 1 segundo antes de verificar nuevamente
+            } while ($runStatus->status === 'queued' || $runStatus->status === 'in_progress');
 
-            if ($run->status === 'completed') {
-                // Obtener los mensajes del thread
+            // Si el run se completó exitosamente, obtener los mensajes
+            if ($runStatus->status === 'completed') {
                 $messages = $client->threads()->messages()->list($threadId);
+                $lastMessage = $messages->data[0]; // El primer mensaje es el más reciente
                 
-                // El primer mensaje debería ser la respuesta del assistant
-                $extractedText = '';
-                if (!empty($messages->data)) {
-                    $latestMessage = $messages->data[0];
-                    if ($latestMessage->role === 'assistant' && !empty($latestMessage->content)) {
-                        $extractedText = $latestMessage->content[0]->text->value;
+                // Extraer el contenido del mensaje de la IA
+                $aiResponse = '';
+                foreach ($lastMessage->content as $content) {
+                    if ($content->type === 'text') {
+                        $aiResponse = $content->text->value;
+                        break;
                     }
                 }
+                
+                $this->deleteFile($fileInfo['path']);
 
                 return response()->json([
                     'success' => true,
-                    'extracted_text' => $extractedText,
+                    'data' => [
+                        'message' => json_decode($aiResponse, true),
+                        'run_id' => $runId,
+                        'thread_id' => $threadId,
+                        'status' => $runStatus->status
+                    ],
                     'metadata' => [
-                        'conversation_id' => $threadId,
-                        'file_info' => $fileInfo,
-                        'run_id' => $run->id,
-                        'assistant_id' => 'asst_kMOfRpaCxApxktOJWKcyi1VB'
+                        'file_info' => $fileInfo
                     ],
                 ], 200);
             } else {
+                $this->deleteFile($fileInfo['path']);
+                // Si el run falló o fue cancelado
                 return response()->json([
                     'success' => false,
-                    'error' => 'Failed to process image: ' . $run->status,
+                    'error' => 'Run failed with status: ' . $runStatus->status,
+                    'data' => [
+                        'run_id' => $runId,
+                        'thread_id' => $threadId,
+                        'status' => $runStatus->status
+                    ],
                     'metadata' => [
-                        'conversation_id' => $threadId,
-                        'file_info' => $fileInfo,
-                        'run_status' => $run->status
+                        'file_info' => $fileInfo
                     ],
                 ], 500);
             }
 
         } catch (\Exception $e) {
+            $this->deleteFile($fileInfo['path']);
             return response()->json([
                 'success' => false,
                 'error' => 'Error processing image: ' . $e->getMessage(),
+                'error_details' => [
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                    'trace' => $e->getTraceAsString(),
+                    'code' => $e->getCode()
+                ],
                 'metadata' => [
-                    'conversation_id' => $threadId,
                     'file_info' => $fileInfo
                 ],
             ], 500);
@@ -121,32 +142,22 @@ class OcrChatbotController extends Controller
         ];
     }
 
-
-    protected function deleteFile(Request $request)
+    protected function deleteFile(string $path)
     {
-        $path = $request->input('path');
-        
         if (!$path) {
-            return response()->json([
-                'error' => 'Path is required'
-            ], 400);
+            return '';
         }
 
-        // Remove 'storage/' from the beginning of the path if it exists
-        $path = str_replace('storage/', '', $path);
+        // Validate path format (should be like: uploads/filename.ext)
+        if (!preg_match('/^uploads\/[^\/]+$/', $path)) {
+            return '';
+        }
         
         if (Storage::disk('public')->exists($path)) {
             Storage::disk('public')->delete($path);
-            
-            return response()->json([
-                'message' => 'File deleted successfully',
-                'path' => $path
-            ], 200);
         }
 
-        return response()->json([
-            'error' => 'File not found',
-            'path' => $path
-        ], 404);
+        return '';
+
     }
 }
